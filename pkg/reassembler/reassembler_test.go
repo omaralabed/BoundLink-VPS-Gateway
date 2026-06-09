@@ -77,20 +77,54 @@ func TestNackOnGap(t *testing.T) {
 	}
 }
 
+func TestFECRecoveryAtHeadGap(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.AckResend = true
+	sb := NewSessionBuffer(protocol.ClassLiveMedia, cfg)
+
+	sb.Insert(makePkt(0, 1, false))
+	res := sb.Insert(makePkt(1, 2, true)) // FEC only for missing primary at seq 1
+	if len(res.Ready) != 1 || res.Ready[0].Payload[0] != 1 {
+		t.Fatalf("expected FEC delivery for seq 1, got %v", res.Ready)
+	}
+	if !res.Ready[0].IsFEC() {
+		t.Fatal("expected FEC packet delivered")
+	}
+}
+
 func TestFECRecoveryAfterTimeout(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.LiveReorderMin = 10 * time.Millisecond
-	cfg.AckResend = false
+	cfg.AckResend = true
 	sb := NewSessionBuffer(protocol.ClassLiveMedia, cfg)
 
 	sb.Insert(makePkt(0, 1, false))
 	sb.Insert(makePkt(2, 1, false))
-	sb.Insert(makePkt(1, 1, true))
+	res := sb.Insert(makePkt(1, 2, true))
+	if len(res.Ready) == 0 || res.Ready[0].Payload[0] != 1 {
+		t.Fatalf("expected FEC seq 1 delivered immediately, got %v", res.Ready)
+	}
+}
+
+func TestSweepNackWithoutIngress(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.LiveReorderMin = 5 * time.Millisecond
+	cfg.LiveReorderMax = 50 * time.Millisecond
+	r := New(cfg)
+
+	r.Process(makePkt(0, 1, false), nil)
+	r.Process(makePkt(2, 1, false), nil)
 
 	time.Sleep(15 * time.Millisecond)
-	out := sb.Insert(makePkt(3, 1, false))
-	if len(out.Ready) == 0 {
-		t.Fatal("expected progress after fec timeout")
+	sweeps := r.Sweep(time.Now())
+	found := false
+	for _, s := range sweeps {
+		if len(s.Result.NackSeq) > 0 && s.Result.NackSeq[0] == 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected sweep to emit NACK for seq 1 without new ingress")
 	}
 }
 
@@ -106,7 +140,7 @@ func TestDuplicateDropped(t *testing.T) {
 func TestAckAfterDelivery(t *testing.T) {
 	r := New(DefaultConfig())
 	res := r.Process(makePkt(0, 1, false), nil)
-	if res.AckSeq != 0 {
-		t.Fatalf("expected ack 0, got %d", res.AckSeq)
+	if !res.HasAck || res.AckSeq != 0 {
+		t.Fatalf("expected HasAck with ack seq 0, got HasAck=%v AckSeq=%d", res.HasAck, res.AckSeq)
 	}
 }

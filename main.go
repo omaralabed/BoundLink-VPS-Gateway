@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"os"
@@ -30,16 +31,27 @@ func main() {
 	}
 	defer srv.Close()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srv.StartBackground(ctx)
+
 	log.Printf("boundlink-vps: listening on %s", srv.ListenAddr())
 
+	errCh := make(chan error, 1)
 	go func() {
-		if err := srv.Run(); err != nil {
-			log.Fatalf("run: %v", err)
-		}
+		errCh <- srv.Run(ctx)
 	}()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	log.Println("boundlink-vps: shutting down")
+	select {
+	case <-sig:
+		log.Println("boundlink-vps: shutting down")
+		cancel()
+	case err := <-errCh:
+		if err != nil {
+			log.Printf("boundlink-vps: run ended: %v", err)
+		}
+	}
 }

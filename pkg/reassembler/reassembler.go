@@ -17,8 +17,15 @@ type pendingPacket struct {
 // Result is returned after processing one ingress packet.
 type Result struct {
 	Ready   []*protocol.Packet
-	AckSeq  uint32   // highest contiguous seq delivered; 0 = none
+	AckSeq  uint32   // highest contiguous seq delivered (inclusive)
+	HasAck  bool     // true when AckSeq should be sent to Pi
 	NackSeq []uint32 // missing seqs to request from Pi
+}
+
+// SweepResult bundles a session ID with control/egress output from a background tick.
+type SweepResult struct {
+	SessionID uint32
+	Result    Result
 }
 
 // SessionBuffer holds out-of-order packets for one session + class.
@@ -34,6 +41,7 @@ type SessionBuffer struct {
 	linkTransit map[uint8]time.Duration
 	gapSince    time.Time
 	nackSentAt  time.Time
+	nackRetries int
 }
 
 // NewSessionBuffer creates a reorder buffer for a session.
@@ -66,9 +74,21 @@ func (sb *SessionBuffer) Insert(pkt *protocol.Packet) Result {
 	sb.observeTransit(pkt, now)
 
 	if pkt.IsFEC() {
+		if pkt.Sequence < sb.nextSeq {
+			return Result{}
+		}
 		sb.fecCopies[pkt.Sequence] = pkt
+		sb.pruneStaleFEC()
+		if pkt.Sequence == sb.nextSeq {
+			if ready := sb.tryDeliverNextFEC(); len(ready) > 0 {
+				return sb.finishResult(ready, now)
+			}
+		}
+		if pkt.Sequence > sb.nextSeq && sb.gapSince.IsZero() {
+			sb.gapSince = now
+		}
 		ready := sb.drainReady(now)
-		return sb.finishResult(ready)
+		return sb.finishResult(ready, now)
 	}
 
 	if pkt.Sequence < sb.nextSeq {
@@ -80,24 +100,41 @@ func (sb *SessionBuffer) Insert(pkt *protocol.Packet) Result {
 		ready = append(ready, pkt)
 		sb.nextSeq++
 		sb.clearGapState()
+		sb.pruneStaleFEC()
 		ready = append(ready, sb.drainSequential()...)
-		return sb.finishResult(ready)
+		return sb.finishResult(ready, now)
 	}
 
-	sb.buffer[pkt.Sequence] = pendingPacket{pkt: pkt, received: now}
+	if _, exists := sb.buffer[pkt.Sequence]; !exists {
+		sb.buffer[pkt.Sequence] = pendingPacket{pkt: pkt, received: now}
+	}
 	if sb.gapSince.IsZero() {
 		sb.gapSince = now
 	}
 	ready := sb.drainReady(now)
-	return sb.finishResult(ready)
+	return sb.finishResult(ready, now)
 }
 
-func (sb *SessionBuffer) finishResult(ready []*protocol.Packet) Result {
+// Tick advances timers without new ingress (NACK / gap timeout / FEC delivery).
+func (sb *SessionBuffer) Tick(now time.Time) Result {
+	ready := sb.drainReady(now)
+	if len(ready) == 0 && sb.gapSince.IsZero() {
+		res := Result{}
+		if nack := sb.checkNack(now); len(nack) > 0 {
+			res.NackSeq = nack
+		}
+		return res
+	}
+	return sb.finishResult(ready, now)
+}
+
+func (sb *SessionBuffer) finishResult(ready []*protocol.Packet, now time.Time) Result {
 	res := Result{Ready: ready}
 	if sb.cfg.AckResend && len(ready) > 0 && sb.nextSeq > 0 {
+		res.HasAck = true
 		res.AckSeq = sb.nextSeq - 1
 	}
-	if nack := sb.checkNack(time.Now()); len(nack) > 0 {
+	if nack := sb.checkNack(now); len(nack) > 0 {
 		res.NackSeq = nack
 	}
 	return res
@@ -158,24 +195,53 @@ func (sb *SessionBuffer) drainSequential() []*protocol.Packet {
 		ready = append(ready, pending.pkt)
 		sb.nextSeq++
 		sb.clearGapState()
+		sb.pruneStaleFEC()
 	}
 	return ready
 }
 
-func (sb *SessionBuffer) drainReady(now time.Time) []*protocol.Packet {
+func (sb *SessionBuffer) tryDeliverNextFEC() []*protocol.Packet {
+	fec, ok := sb.fecCopies[sb.nextSeq]
+	if !ok {
+		return nil
+	}
+	if _, hasPrimary := sb.buffer[sb.nextSeq]; hasPrimary {
+		return nil
+	}
+	delete(sb.fecCopies, sb.nextSeq)
+	delete(sb.buffer, sb.nextSeq)
 	var ready []*protocol.Packet
+	ready = append(ready, fec)
+	sb.nextSeq++
+	sb.clearGapState()
+	sb.pruneStaleFEC()
+	ready = append(ready, sb.drainSequential()...)
+	return ready
+}
+
+func (sb *SessionBuffer) drainReady(now time.Time) []*protocol.Packet {
+	if ready := sb.tryDeliverNextFEC(); len(ready) > 0 {
+		return ready
+	}
 
 	if pending, ok := sb.buffer[sb.nextSeq]; ok && !pending.pkt.IsFEC() {
 		delete(sb.buffer, sb.nextSeq)
+		var ready []*protocol.Packet
 		ready = append(ready, pending.pkt)
 		sb.nextSeq++
 		sb.clearGapState()
+		sb.pruneStaleFEC()
 		ready = append(ready, sb.drainSequential()...)
 		return ready
 	}
 
 	sb.checkGapTimeout(now)
 
+	if ready := sb.tryDeliverNextFEC(); len(ready) > 0 {
+		return ready
+	}
+
+	var ready []*protocol.Packet
 	for seq, pending := range sb.buffer {
 		if seq == sb.nextSeq {
 			continue
@@ -190,6 +256,7 @@ func (sb *SessionBuffer) drainReady(now time.Time) []*protocol.Packet {
 			if seq == sb.nextSeq {
 				sb.nextSeq++
 				sb.clearGapState()
+				sb.pruneStaleFEC()
 				ready = append(ready, sb.drainSequential()...)
 			}
 		}
@@ -209,16 +276,21 @@ func (sb *SessionBuffer) checkGapTimeout(now time.Time) {
 			return // NACK emitted via checkNack
 		}
 		if !sb.nackSentAt.IsZero() && now.Sub(sb.nackSentAt) >= sb.cfg.NackGrace {
+			if _, hasFEC := sb.fecCopies[sb.nextSeq]; hasFEC {
+				return
+			}
 			delete(sb.buffer, sb.nextSeq)
 			delete(sb.fecCopies, sb.nextSeq)
 			sb.nextSeq++
 			sb.clearGapState()
+			sb.pruneStaleFEC()
 		}
 		return
 	}
 	if elapsed >= sb.budget {
 		sb.nextSeq++
 		sb.clearGapState()
+		sb.pruneStaleFEC()
 	}
 }
 
@@ -229,17 +301,43 @@ func (sb *SessionBuffer) checkNack(now time.Time) []uint32 {
 	if _, ok := sb.buffer[sb.nextSeq]; ok {
 		return nil
 	}
+	if _, ok := sb.fecCopies[sb.nextSeq]; ok {
+		return nil
+	}
 	elapsed := now.Sub(sb.gapSince)
-	if sb.nackSentAt.IsZero() && elapsed >= sb.budget {
+	if elapsed < sb.budget {
+		return nil
+	}
+	if sb.nackSentAt.IsZero() {
 		sb.nackSentAt = now
+		sb.nackRetries = 1
+		return []uint32{sb.nextSeq}
+	}
+	retryAfter := sb.cfg.NackGrace / 2
+	if retryAfter < 50*time.Millisecond {
+		retryAfter = 50 * time.Millisecond
+	}
+	if sb.nackRetries < 3 && now.Sub(sb.nackSentAt) >= retryAfter &&
+		now.Sub(sb.nackSentAt) < sb.cfg.NackGrace {
+		sb.nackSentAt = now
+		sb.nackRetries++
 		return []uint32{sb.nextSeq}
 	}
 	return nil
 }
 
+func (sb *SessionBuffer) pruneStaleFEC() {
+	for seq := range sb.fecCopies {
+		if seq < sb.nextSeq {
+			delete(sb.fecCopies, seq)
+		}
+	}
+}
+
 func (sb *SessionBuffer) clearGapState() {
 	sb.gapSince = time.Time{}
 	sb.nackSentAt = time.Time{}
+	sb.nackRetries = 0
 }
 
 // Reassembler manages multiple session buffers.
@@ -265,6 +363,7 @@ func (r *Reassembler) Process(pkt *protocol.Packet, remote *net.UDPAddr) Result 
 		return Result{}
 	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	sb, ok := r.sessions[pkt.SessionID]
 	if !ok {
 		sb = NewSessionBuffer(pkt.Class, r.cfg)
@@ -279,8 +378,21 @@ func (r *Reassembler) Process(pkt *protocol.Packet, remote *net.UDPAddr) Result 
 		cp := *remote
 		addrs[pkt.SourceLinkID] = &cp
 	}
-	r.mu.Unlock()
 	return sb.Insert(pkt)
+}
+
+// Sweep runs timer logic for all sessions (NACK / gap recovery without new ingress).
+func (r *Reassembler) Sweep(now time.Time) []SweepResult {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]SweepResult, 0, len(r.sessions))
+	for sid, sb := range r.sessions {
+		res := sb.Tick(now)
+		if len(res.Ready) > 0 || res.HasAck || len(res.NackSeq) > 0 {
+			out = append(out, SweepResult{SessionID: sid, Result: res})
+		}
+	}
+	return out
 }
 
 // SessionAddrs returns known Pi source addresses for a session (all links).
