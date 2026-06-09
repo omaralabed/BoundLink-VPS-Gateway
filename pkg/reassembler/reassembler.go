@@ -375,8 +375,12 @@ func (r *Reassembler) Process(pkt *protocol.Packet, remote *net.UDPAddr) Result 
 			addrs = make(map[uint8]*net.UDPAddr)
 			r.sessionAddrs[pkt.SessionID] = addrs
 		}
-		cp := *remote
-		addrs[pkt.SourceLinkID] = &cp
+		cp := &net.UDPAddr{
+			IP:   append(net.IP(nil), remote.IP...),
+			Port: remote.Port,
+			Zone: remote.Zone,
+		}
+		addrs[pkt.SourceLinkID] = cp
 	}
 	return sb.Insert(pkt)
 }

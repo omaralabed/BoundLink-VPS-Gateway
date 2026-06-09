@@ -1,6 +1,7 @@
 package reassembler
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -142,5 +143,19 @@ func TestAckAfterDelivery(t *testing.T) {
 	res := r.Process(makePkt(0, 1, false), nil)
 	if !res.HasAck || res.AckSeq != 0 {
 		t.Fatalf("expected HasAck with ack seq 0, got HasAck=%v AckSeq=%d", res.HasAck, res.AckSeq)
+	}
+}
+
+func TestSessionAddrsPersist(t *testing.T) {
+	r := New(DefaultConfig())
+	remote := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 10), Port: 45000}
+	r.Process(makePkt(0, 1, false), remote)
+
+	addrs := r.SessionAddrs(1)
+	if len(addrs) != 1 {
+		t.Fatalf("expected 1 addr, got %d", len(addrs))
+	}
+	if addrs[0].String() != remote.String() {
+		t.Fatalf("addr corrupted: got %s want %s", addrs[0], remote)
 	}
 }

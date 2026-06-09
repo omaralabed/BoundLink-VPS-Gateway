@@ -2,25 +2,21 @@
 
 ## Purpose
 
-Bound Link bonds Starlink (low latency) and Ku-band (high latency) into one logical pipe
+Bound Link bonds multiple WAN links (e.g. Starlink + Ku-band) into one logical upload path
 with a latency-aware scheduler. It supports sub-second live streaming over SRT, RTP, and
-WebRTC while still using both links.
+WebRTC while using both links for throughput.
 
-## Design Principles
-
-1. **Never send primary live media on a high-latency link when a low-latency link is healthy.**
-2. **Ku-band contributes via FEC, backup, and bulk — not as equal partner for Class A traffic.**
-3. **Scheduler decisions are driven by measured RTT, loss, and throughput — not static ratios.**
-4. **VPS reorder buffer for live traffic is capped at 200 ms to preserve sub-second latency.**
+**Repos:** [boundlink-go](https://github.com/omaralabed/boundlink-go) (Pi Router) ·
+[BoundLink-VPS-Gateway](https://github.com/omaralabed/BoundLink-VPS-Gateway) (VPS)
 
 ## Components
 
 ```
 Boat/Remote                          VPS                         Destination
 ┌──────────────────┐                ┌─────────────────┐
-│ boundlink-router │── Starlink ────►│ boundlink-vps   │────► SRT/RTP/WebRTC
+│ boundlink-pi     │── Starlink ────►│ boundlink-vps   │────► SRT/RTP/WebRTC
 │  • classifier    │── Ku-band ─────►│  • reassembler  │      consumers
-│  • scheduler     │                │  • FEC merge    │
+│  • scheduler     │◄── ACK/NACK ────│  • ACK/NACK     │
 │  • link monitor  │                │  • egress       │
 │  • tunnel client │                │                 │
 └──────────────────┘                └─────────────────┘
@@ -28,62 +24,115 @@ Boat/Remote                          VPS                         Destination
 
 ## Traffic Classes
 
-| Class | Name            | Latency budget | Starlink        | Ku-band              |
-|-------|-----------------|----------------|-----------------|----------------------|
-| A     | LiveMedia       | < 1 s          | Primary (~100%) | FEC / hot standby    |
-| B     | ResilientStream | 1–3 s          | ~70% weighted   | ~30% weighted        |
-| C     | Bulk            | Best effort    | Capacity-weight | Capacity-weight      |
+| Class | Name            | Latency target | Scheduling |
+|-------|-----------------|----------------|------------|
+| A     | LiveMedia       | < 1 s          | See live modes below |
+| B     | ResilientStream | 1–3 s          | Quality-weighted (smart) or equal (bond_all) |
+| C     | Bulk            | Best effort    | Quality-weighted (smart) or equal (bond_all) |
 
-## Scheduler Logic
+## Live modes (Class A)
 
-### Link health
+Configured via `scheduler.live_mode` on the Pi.
 
-A link is **healthy** when:
-- Gateway responds to probe within timeout
-- Loss ≤ configured threshold (default 25%)
-- Status is not explicitly `Down`
+### `liveu_like` (default — LiveU-style)
 
-A link is **degraded** when:
-- RTT > `max_latency_ms` OR loss > 10% but ≤ 25%
+- Equal packet rotation across healthy WANs (50/50 for two links).
+- Each link carries **unique** packets — no FEC duplicates.
+- Combined throughput appears at the receiver (like LiveU Starlink + LAN2).
+- `enable_fec` should be `false`.
+- Requires VPS adaptive reorder + ACK/NACK resend to handle out-of-order arrival.
 
-### Weight formula (Class B and C)
+### `primary_fec` (classic Smart live)
+
+- Primary on best-quality low-latency link (Starlink at sea).
+- Optional FEC copy on most stable alternate link (typically Ku-band).
+- Ku-band contributes recovery copies, not equal primary traffic.
+- `enable_fec` should be `true`.
+
+### Brain (`aggressive_bond: auto`)
+
+When two **stable, similar** WANs appear (dock/office — not Starlink + Ku-band at sea),
+the brain auto-switches live upload to equal bonding (`live-brain-bond`).
+
+Qualifies when:
+- All links `StatusUp`, loss below unstable threshold
+- RTT spread ≤ `aggressive_max_rtt_spread_ms` (default 150 ms)
+- Quality scores within `stable_quality_close_ratio` (default 0.65)
+
+Only applies in `primary_fec` mode — `liveu_like` always bonds equally.
+
+## Link health
+
+A link is **healthy** when status is `Up` or `Degraded` (still schedulable).
+
+| Status    | Condition |
+|-----------|-----------|
+| Up        | RTT ≤ max, loss ≤ max_loss/2, jitter ≤ 40 ms |
+| Degraded  | RTT > max_latency OR loss > max_loss/2 OR high jitter — still carries traffic |
+| Down      | Loss ≥ 100% OR loss > max_loss_percent (default 25%) |
+
+Probes use DNS to `probe_target` (default `1.1.1.1:53`) bound per WAN interface.
+
+## Weight formula (Class B and C, smart mode)
 
 ```
 weight(link) = throughput_bps × (1 - loss_ratio) / (rtt_ms + base_rtt_ms)
 ```
 
-Weights are normalized. Packet N goes to link `i` when:
-```
-cumulative_weight(i-1) < (N mod 1000) / 1000 ≤ cumulative_weight(i)
-```
+## VPS reassembly
 
-### Class A (LiveMedia)
+### Adaptive live reorder
 
-1. Select primary = lowest RTT among healthy links.
-2. If primary RTT > 200 ms, still use it (failover scenario) but log warning.
-3. FEC duplicate: send on best alternate healthy link (typically Ku-band).
-4. If primary fails mid-stream, promote next-lowest RTT link immediately.
+For Class A, the VPS reorder budget scales with measured per-link transit spread:
 
-### Reorder buffer (VPS)
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `live_reorder_min_ms` | 200 ms | Minimum wait before NACK / gap handling |
+| `live_reorder_max_ms` | 1200 ms | Cap for disparate links (Starlink + Ku-band) |
+| `nack_grace_ms` | 200 ms | Extra wait after NACK before skipping a gap |
 
-| Class | Max buffer |
-|-------|------------|
-| A     | 200 ms     |
-| B     | 2000 ms    |
-| C     | 5000 ms    |
+Budget = `min + (max_transit - min_transit) + 50ms`, clamped to min/max.
 
-Late packets beyond buffer limit are dropped (not retransmitted at tunnel layer;
-SRT/WebRTC handle their own recovery).
+### Non-live classes
 
-## Protocol
+Uses static class budgets from `TrafficClass.ReorderBudget()` (B: 2 s, C: 5 s).
 
-See `pkg/protocol/packet.go` for wire format.
+### Gap recovery
 
-## Protocol Detection
+1. Out-of-order packets buffered until `nextSeq` arrives.
+2. After budget elapsed: VPS sends **NACK** to Pi (retries up to 3×).
+3. Pi resends from packet cache (`tunnel.ack_resend: true`).
+4. If primary lost: **FEC copy** delivered at head gap when available.
+5. After NACK grace with no recovery: gap skipped (lossy).
 
-| Protocol | Detection                          | Default class |
-|----------|------------------------------------|---------------|
-| SRT      | UDP dest port 4200 (configurable)  | A             |
-| RTP      | UDP even port, RTP version 2       | A             |
-| WebRTC   | UDP STUN/TURN/media ports          | A             |
-| Other    | Config rules or default            | C             |
+Background **sweep** (50 ms) runs NACK/gap logic even when ingress pauses.
+
+### Egress
+
+- Always binds an ephemeral UDP egress socket.
+- Per-packet `DestIP`/`DestPort` from Pi (gateway capture) takes priority.
+- `egress_addr` in config is fallback when Pi sends no destination.
+
+## BDLK protocol
+
+36-byte header + payload. See `pkg/protocol/packet.go`.
+
+| Field | Purpose |
+|-------|---------|
+| SessionID / Sequence | Per-stream ordering |
+| SourceLinkID | Which WAN link sent this copy |
+| DestIP / DestPort | Original destination (Pi → VPS → studio) |
+| Flags | Primary, FEC, ACK, NACK, Resend |
+
+Control messages (VPS → Pi): cumulative **ACK** (trim resend cache), **NACK** (request resend).
+
+## Protocol detection (Pi classifier)
+
+| Protocol | Detection | Class |
+|----------|-----------|-------|
+| SRT      | UDP port (4200, 9000, ingress port) or payload | A |
+| RTP      | Port range 5000–5200 + RTP version bits | A |
+| WebRTC   | STUN/TURN/media ports | A |
+| RDP/VNC/Gaming | Configured ports | B |
+| VPN      | Configured ports | C |
+| Other    | `default_class` (bulk) | C |
