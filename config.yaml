@@ -1,0 +1,11 @@
+listen_port: 6500
+
+# Studio or destination for reassembled streams (optional)
+egress_addr: "studio.example.com:5000"
+
+# Adaptive reorder + ack/resend for LiveU-style bonding
+reassembly:
+  live_reorder_min_ms: 200
+  live_reorder_max_ms: 1200
+  nack_grace_ms: 200
+  ack_resend: true

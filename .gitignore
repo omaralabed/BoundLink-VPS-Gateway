@@ -1,0 +1,22 @@
+# Binaries
+boundlink-vps
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Local / secrets — do not commit
+config.local.yaml
+.env
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Test / build
+*.test
+coverage.out
