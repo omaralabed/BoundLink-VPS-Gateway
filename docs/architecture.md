@@ -36,7 +36,8 @@ Configured via `scheduler.live_mode` on the Pi.
 
 ### `liveu_like` (default — LiveU-style)
 
-- Equal packet rotation across healthy WANs (50/50 for two links).
+- Equal packet rotation across healthy WANs (50/50 for two links) when **both are stable** (`StatusUp`, low loss).
+- When a link is **degraded or unstable** (e.g. MiFi losing packets), split **shifts by quality score** (~80/20 Starlink/MiFi) instead of blind 50/50.
 - Each link carries **unique** packets — no FEC duplicates.
 - Combined throughput appears at the receiver (like LiveU Starlink + LAN2).
 - `enable_fec` should be `false`.
